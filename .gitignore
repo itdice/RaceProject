@@ -1,9 +1,10 @@
 # Git
+.git/
 .idea/
 
 # Build Files
-Build/
-Debug/
+/Debug
+/Release
 
 # Executables
 *.exe

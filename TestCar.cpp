@@ -1,173 +1,167 @@
 ﻿#include <iostream>
 #include <algorithm>
 #include <vector>
+#include <cmath>
 #include "RuleBasedDriving.h"
 
 using namespace std;
 using namespace Car;
 
-bool is_debug = false;  // true -> 차량 상황 디버깅용 데이터 출력, false -> 차량 상황 디버깅 없이 수행
-bool enable_api_control = true;	 // true -> 코드를 통한 자율주행, false -> 키보드를 이용한 수동주행
+constexpr bool debugMode = true;  // 디버깅용 로그 데이터 출력 여부
+constexpr bool autopilotMode = true;  // 자율주행 코드 적용 여부
 
-ControlValues control_driving(CarStateValues sensing_info)
+// 조정 가능한 매개변수
+struct ControlParameters {
+	bool is_start = false;  // 출발 여부 감지
+
+	float wheelbase = 2.5f;  // 차량 휠베이스 (m)
+
+	float max_speed = 200.0f;  // 차량 설계 최고 속도 (km/h)
+	float base_target_speed = 100.0f;  // 기본 목표 속도 (km/h)
+	float speed_accept = 0.1f;  // 차량 속도 인정 범위 (%)
+
+	float min_steering = 0.1f;  // 최소 스티어링 휠 각도 - 최대 속도 시 (%)
+	float max_steering = 0.8f;  // 최대 스티어링 휠 각도 - 최소 속도 시 (%)
+	int steering_slope = 1;  // 속도별 최대 스티어링 휠 상수
+	float distance_steering_ratio = 0.3f;  // 거리기준 스티어링 영향도
+	float angle_steering_ratio = 0.7f;  // 각도기준 스티어링 영향도
+
+	float past_steering_value = 0.0f;  // 이전 스티어링 휠 각도 (%)
+	float max_difference_steering = 0.03f;  // 최대 스티어링 휠 각도 변화 (%);
+};
+
+ControlParameters params;
+
+ControlValues driveControl(CarStateValues sensing_info)
 {
-	if (is_debug)
-	{
-		cout << "=========================================================" << endl;
-		cout << "[MyCar] to middle: " << sensing_info.to_middle << endl;
-
-		cout << "[MyCar] collided: " << sensing_info.collided << endl;
-		cout << "[MyCar] car speed: " << sensing_info.speed << "km/h" << endl;
-
-		cout << "[MyCar] is moving forward: " << sensing_info.moving_forward << endl;
-		cout << "[MyCar] moving angle: " << sensing_info.moving_angle << endl;
-		cout << "[MyCar] lap_progress: " << sensing_info.lap_progress << endl;
-
-		cout << "[MyCar] track_forward_angles: ";
-		for (int i = 0; i < sensing_info.track_forward_angles.size(); i++)
-		{
-			cout << sensing_info.track_forward_angles[i] << ", ";
-		}
-		cout << endl;
-
-		cout << "[MyCar] track_forward_obstacles: ";
-		for (int i = 0; i < sensing_info.track_forward_obstacles.size(); i++)
-		{
-			cout << "{dist: " << sensing_info.track_forward_obstacles[i].dist 
-				 << ", to_middle: " << sensing_info.track_forward_obstacles[i].to_middle << "}, ";
-		}
-		cout << endl;
-
-		cout << "[MyCar] opponent_cars_info: ";
-		for (int i = 0; i < sensing_info.opponent_cars_info.size(); i++)
-		{
-			cout << "{dist: " << sensing_info.opponent_cars_info[i].dist 
-				 << ", to_middle: " << sensing_info.opponent_cars_info[i].to_middle 
-				 << ", speed: " << sensing_info.opponent_cars_info[i].speed << "km/h}, ";
-		}
-		cout << endl;
-
-		cout << "[MyCar] distance_to_way_points: ";
-		for (int i = 0; i < sensing_info.distance_to_way_points.size(); i++)
-		{
-			cout << sensing_info.distance_to_way_points[i] << ", ";
-		}
-		cout << endl;
-
-		cout << "=========================================================" << endl;
-	}
-
 	ControlValues car_controls;
 
-	// ===========================================================
-	// Area for writing code about driving rule
-	// ===========================================================
-	// Editing area starts from here
-	// ===========================================================
+	// ┏━━━━━━━━━━━━━━━━┓
+	// ┃ Autopilot Mode ┃
+	// ┗━━━━━━━━━━━━━━━━┛
 
-	// 도로의 실제 폭의 1/2 로 계산됨
-	float half_load_width = sensing_info.half_road_limit - 1.25f;
+	// 차량 속도 관련
+	float speed = sensing_info.speed;  // 현재 차량 속도 (km/h)
+	float target_speed = params.base_target_speed;  // 차량 목표 속도 (km/h)
 
-	// 차량 핸들 조정을 위해 참고할 전방의 커브 값 가져오기
-	int angle_num = (int)(sensing_info.speed / 45);
-	float ref_angle = angle_num > 0 ? sensing_info.track_forward_angles[angle_num] : 0;
+	// 차량 방향 및 속도 제어 관련
+	float steering = 0.0f;  // 차량 스티어링 휠 제어 (%)
+	float throttle = 1.0f;  // 차량 엑셀 제어 (%)
+	float brake = 0.0f;  // 차량 브레이크 제어 (%)
 
-	// 차량의 차선 중앙 정렬을 위한 미세 조정 값 계산
-	float middle_add = (sensing_info.to_middle / 80) * -1;
+	// 도로 및 차량, 장애물 규격 관련
+	float road_half_width = sensing_info.half_road_limit - (params.wheelbase / 2);  // 도로폭 절반 (m)
+	float safe_distance = road_half_width - (params.wheelbase / 2);  // 바퀴가 다 들어가는 도로 중심부터의 거리 (m)
 
-	// 전방의 커브 각도에 따라 throttle 값을 조절하여 속도를 제어함
-	float throttle_factor = 0.6f / (abs(ref_angle) + 0.1f);
-	if (throttle_factor > 0.11f) throttle_factor = 0.11f;   // throttle 값을 최대 0.81 로 설정
-	float set_throttle = 0.7f + throttle_factor;
-	if (sensing_info.speed < 60) set_throttle = 0.9f;  // 속도가 60Km/h 이하인 경우 0.9 로 설정
-	if (sensing_info.speed > 80) set_throttle = 0.6f;  // 최대속도를 80km/h로 설정
+	// 주행 정보 관련
+	bool is_collided = sensing_info.collided;  // 차량 충돌 여부
+	bool is_forward = sensing_info.moving_forward;  // 정주행 여부
+	float distance_from_center = sensing_info.to_middle;  // 도로 중심으로부터 거리 (m)
+	float angle_from_center = sensing_info.moving_angle;  // 도로 중심과의 각도 (°)
+	vector<float> forward_distance_from_center = sensing_info.distance_to_way_points;  // 전방의 도로 중심지점과의 직선 거리 (m)
+	vector<float> forward_angle_from_center = sensing_info.track_forward_angles;  // 전방 도로 중심지점과의 각도 (°)
 
-	// 차량의 Speed 에 따라서 핸들을 돌리는 값을 조정함
-	float steer_factor = sensing_info.speed * 1.5f;
-	if (sensing_info.speed > 70) steer_factor = sensing_info.speed * 0.85f;
-	if (sensing_info.speed > 100) steer_factor = sensing_info.speed * 0.7f;
+	// 출발 전 제어
+	if (!params.is_start && speed == 0.0f) {
+		car_controls.steering = steering;
+		car_controls.throttle = throttle;
+		car_controls.brake = brake;
 
-	// (참고할 전방의 커브 - 내 차량의 주행 각도) / (계산된 steer factor) 값으로 steering 값을 계산
-	float set_steering = (ref_angle - sensing_info.moving_angle) / (steer_factor + 0.001f);
-
-	// 차선 중앙정렬 값을 추가로 고려함
-	set_steering += middle_add;
-
-	///////////////////////////////////////
-	//// 긴급 및 예외 상황 처리 시작 /////////
-	///////////////////////////////////////
-	bool full_throttle = true;
-	bool emergency_brake = false;
-
-	// 전방 커브의 각도가 큰 경우 속도를 제어함
-	// 차량 핸들 조정을 위해 참고하는 커브 보다 조금 더 멀리 참고하여 미리 속도를 줄임
-	int road_range = (int)(sensing_info.speed / 30);
-	for (int i = 0; i < road_range; i++) {
-		float fwd_angle = abs(sensing_info.track_forward_angles[i]);
-		if (fwd_angle > 45) {   // 커브가 45도 이상인 경우 brake, throttle 을 제어
-			full_throttle = false;
-		}
-		if (fwd_angle > 80) {   // 커브가 80도 이상인 경우 steering 까지 추가로 제어
-			emergency_brake = true;
-			break;
-		}
+		return car_controls;
+	}
+	else if (!params.is_start && speed > 0.0f) {
+		cout << "[WLT Race Project] Race Start!!!" << "\n";
+		params.is_start = true;
 	}
 
-	// brake, throttle 제어
-	float set_brake = 0.0f;
-	if (!full_throttle) {
-		if (sensing_info.speed > 100) {
-			set_brake = 0.3f;
-		}
-		if (sensing_info.speed > 120) {
-			set_throttle = 0.7f;
-			set_brake = 0.7f;
-		}
-		if (sensing_info.speed > 130) {
-			set_throttle = 0.5f;
-			set_brake = 1.0f;
-		}
+	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+	// 차량 방향 제어
+	float max_steering = static_cast<float>(params.min_steering + (params.max_steering - params.min_steering) 
+		* exp(-params.steering_slope * (speed / params.max_speed)));  // 현재 속도와 연동된 최대 스티어링 휠 각도
+
+	float distance_difference_ratio = (distance_from_center < 0 ? -1 : 1) *
+		min(1.0f, abs(distance_from_center / safe_distance)) * params.distance_steering_ratio;  // 거리기준 스티어링 제어 비율
+	float angle_difference_ratio = (angle_from_center < 0 ? -1 : 1) *
+		min(1.0f, abs(angle_from_center / 30.0f)) * params.angle_steering_ratio;  // 각도기준 스티어링 제어 비율
+
+
+	float total_ratio = (angle_difference_ratio + distance_difference_ratio < 0 ? -1 : 1) * 
+		min(1.0f, abs(angle_difference_ratio + distance_difference_ratio));  // 최종 스티어링 제어 비율
+	float required_steering = -1 * max_steering * total_ratio;  // 위의 결과를 토대로 스티어링 각도 계산
+
+	if (abs(required_steering - params.past_steering_value) > params.max_difference_steering) {
+		steering = params.past_steering_value + params.max_difference_steering *
+			(required_steering - params.past_steering_value < 0 ? -1 : 1);  // 스티어링이 급격하게 변화하는 경우 점진적으로 변화하도록 함
+	}
+	else {
+		steering = required_steering;
+	}
+	params.past_steering_value = steering;
+
+
+	// 차량 속도 제어
+	float required_speed = target_speed - speed;  // 목표 속도까지 필요한 속도
+
+	if (target_speed * params.speed_accept < required_speed) {
+		throttle = 1.0f;  // 목표속도까지 최대한 가속
+	}
+	else if (0 <= required_speed && required_speed <= target_speed * params.speed_accept) {
+		throttle = static_cast<float>(pow(target_speed / params.max_speed, 0.4));  // 목표속도에 거의 다다르면 적절하게 가속
+	}
+	else if (-1 * target_speed * params.speed_accept <= required_speed && required_speed < 0) {
+		throttle = static_cast<float>(pow(target_speed / params.max_speed, 0.5));  // 목표속도를 약간 초과하면 이전보다 덜 가속
+	}
+	else {
+		throttle = 0.0f;  // 목표속도를 완전히 초과하면 가속 중지
 	}
 
-	// steering 까지 추가로 제어
-	if (emergency_brake) {
-		if (set_steering > 0) {
-			set_steering += 0.3f;
-		}
-		else {
-			set_steering -= 0.3f;
+	// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+	// 최종 제어값 반환
+	car_controls.steering = steering;
+	car_controls.throttle = throttle;
+	car_controls.brake = brake;
+
+	if (debugMode) {
+		printf("=========================================================================\n");
+		printf("[Debug - SPD] %07.3fkm/h -> %07.3fkm/h, THR : %.3f%%, BRK : %.3f%%\n", speed, target_speed, throttle * 100, brake * 100);
+		printf("[Debug - LOC] DFC : %.3fm, AFC : %.3f°\n", distance_from_center, angle_from_center);
+
+		printf("[Debug - FOC] Forward DFC : ");
+		for (const auto value : forward_distance_from_center)
+			printf("%.3fm ", value);
+		printf("\n");
+
+		printf("[Debug - FOC] Forward AFC : ");
+		for (const auto value : forward_angle_from_center)
+			printf("%.3f° ", value);
+		printf("\n");
+
+		printf("[Debug - STR] STR : %.3f%%\n", steering * 100);
+
+		if (is_collided || !is_forward) {
+			printf("[Debug - EXT] ");
+			if (is_collided) { printf("Car Collided "); }
+			if (!is_forward) { printf("Car Backward "); }
+			printf("\n");
 		}
 	}
-
-	///////////////////////////////////////
-	//// 긴급 및 예외 상황 처리 종료 /////////
-	///////////////////////////////////////
-
-	// Moving straight forward
-	car_controls.steering = set_steering;
-	car_controls.throttle = set_throttle;
-	car_controls.brake = set_brake;
-
-	// ===========================================================
-	// Editing area ends
-	// ===========================================================
 
 	return car_controls;
 }
 
 int main()
 {
-	// ===========================================================
+	// =========================
 	// Don't modify below area.
-	// ===========================================================
+	// =========================
 
-	cout << "[MyCar] Start Bot! (CPP)" << endl;
+	cout << "[WLT Race Project] Program Start" << "\n";
 
-	int return_code = StartDriving(control_driving, enable_api_control);
+	int return_code = StartDriving(driveControl, autopilotMode);
 
-	cout << "[MyCar] End Bot! (CPP)" << endl;
-
-	// ==========================================================
+	cout << "[WLT Race Project] Program End" << "\n";
 
 	return return_code;
 }
